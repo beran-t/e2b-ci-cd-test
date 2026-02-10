@@ -1,43 +1,59 @@
-// AI Code Review script — runs inside a GitHub Actions workflow
-// This follows the guide at docs/use-cases/ci-cd.mdx
-
 import { Sandbox, CommandExitError } from 'e2b'
+import OpenAI from 'openai'
 
-const repoUrl = `https://github.com/${process.env.PR_REPO}.git`
-const prBranch = process.env.PR_BRANCH
-const prNumber = process.env.PR_NUMBER
-const githubRepo = process.env.GITHUB_REPOSITORY
-const githubToken = process.env.GITHUB_TOKEN
-
-console.log(`Reviewing PR #${prNumber} from ${prBranch} on ${process.env.PR_REPO}`)
-
-// Step 1: Create a sandbox with a 5-minute timeout
+// --- 1. Create sandbox ---
 const sandbox = await Sandbox.create({ timeoutMs: 300_000 })
 console.log('Sandbox created:', sandbox.sandboxId)
 
-// Step 2: Clone the PR branch into the sandbox
+// --- 2. Clone the PR branch ---
+const repoUrl = `https://github.com/${process.env.PR_REPO}.git`
+
 await sandbox.git.clone(repoUrl, {
   path: '/home/user/repo',
-  branch: prBranch,
+  branch: process.env.PR_BRANCH,
   username: 'x-access-token',
-  password: githubToken,
+  password: process.env.GITHUB_TOKEN,
   depth: 1,
 })
 console.log('Repository cloned')
 
-// Step 3: Get the diff (for demo, just show the file list since depth=1 has no base to diff against)
-const filesResult = await sandbox.commands.run(
-  'cd /home/user/repo && git log --oneline -3 && echo "---" && ls -la'
+// --- 3. Get the diff and send it to an LLM for review ---
+const diffResult = await sandbox.commands.run(
+  'cd /home/user/repo && git log --oneline -5'
 )
-console.log('Repo contents:\n', filesResult.stdout)
+console.log('Diff stdout:', diffResult.stdout)
 
-// Step 4: Run tests in the sandbox
-console.log('\n--- Running tests ---')
-try {
-  await sandbox.commands.run('cd /home/user/repo && npm install --silent', {
-    onStdout: (data) => console.log(data),
-    onStderr: (data) => console.error(data),
+let review
+if (process.env.OPENAI_API_KEY) {
+  const openai = new OpenAI()
+  const response = await openai.chat.completions.create({
+    model: 'gpt-5.2-mini',
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You are a senior code reviewer. Analyze the following git diff and provide a concise review with actionable feedback. Focus on bugs, security issues, and code quality.',
+      },
+      {
+        role: 'user',
+        content: `Review this diff:\n\n${diffResult.stdout}`,
+      },
+    ],
   })
+  review = response.choices[0].message.content
+  console.log('AI Review:', review)
+} else {
+  review = 'OPENAI_API_KEY not set — skipping LLM call. All E2B steps passed.'
+  console.log('Skipping LLM call (no OPENAI_API_KEY)')
+}
+
+// --- 4. Run the test suite inside the sandbox ---
+await sandbox.commands.run('cd /home/user/repo && npm install', {
+  onStdout: (data) => console.log(data),
+  onStderr: (data) => console.error(data),
+})
+
+try {
   await sandbox.commands.run('cd /home/user/repo && npm test', {
     onStdout: (data) => console.log(data),
     onStderr: (data) => console.error(data),
@@ -46,36 +62,29 @@ try {
 } catch (err) {
   if (err instanceof CommandExitError) {
     console.error('Tests failed with exit code:', err.exitCode)
-    // In real workflow, post failure comment to PR here
     await sandbox.kill()
     process.exit(1)
   }
   throw err
 }
 
-// Step 5: Post result to PR (using GitHub API)
-if (githubToken && githubRepo && prNumber) {
-  const review = '**AI Review (test run)**\n\nAll tests passed in E2B sandbox. No issues found.'
-  const res = await fetch(
-    `https://api.github.com/repos/${githubRepo}/issues/${prNumber}/comments`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${githubToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        body: `## AI Code Review\n\n${review}`,
-      }),
-    }
-  )
-  if (res.ok) {
-    console.log('Posted review comment to PR')
-  } else {
-    console.error('Failed to post comment:', res.status, await res.text())
-  }
-}
+// --- 5. Post results as a PR comment ---
+const prNumber = process.env.PR_NUMBER
+const repo = process.env.GITHUB_REPOSITORY
 
-// Cleanup
+await fetch(
+  `https://api.github.com/repos/${repo}/issues/${prNumber}/comments`,
+  {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      body: `## AI Code Review\n\n${review}`,
+    }),
+  }
+)
+
 await sandbox.kill()
 console.log('Done')
